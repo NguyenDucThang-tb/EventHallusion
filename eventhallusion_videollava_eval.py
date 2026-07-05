@@ -35,6 +35,11 @@ except Exception:  # pragma: no cover
     VideoReader = None
     cpu = None
 
+try:
+    import cv2
+except Exception:  # pragma: no cover
+    cv2 = None
+
 
 SPLIT_CANDIDATES = {
     "misleading": [
@@ -162,6 +167,16 @@ def make_spatial_negative(frames: np.ndarray, sigma: float = 20.0) -> np.ndarray
     return np.stack([add_gaussian_noise(f, sigma=sigma) for f in frames], axis=0)
 
 
+def gaussian_sigma_ratio(sigma: float, pixel_max: float = 255.0) -> float:
+    """Approximate noise scale relative to the 8-bit pixel range."""
+    return float(sigma) / float(pixel_max)
+
+
+def summarize_spatial_gaussian(sigma: float) -> str:
+    ratio = gaussian_sigma_ratio(sigma)
+    return f"sigma={sigma:.1f}, approx_noise_ratio={ratio:.3f} of pixel range"
+
+
 def normalize_yes_no(text: str) -> str:
     text = (text or "").strip()
     if not text:
@@ -175,25 +190,49 @@ def normalize_yes_no(text: str) -> str:
     return text
 
 
-def build_prompt(question: str) -> str:
-    return (
-        "Answer the question using ONLY one word: Yes or No.\n\n"
-        f"Question:\n{question}\n"
-    )
+def build_prompt(question: str, context_prefix: str = "") -> str:
+    prefix = context_prefix.strip()
+    parts = []
+    if prefix:
+        parts.append(prefix)
+    parts.append("Answer the question using ONLY one word: Yes or No.")
+    parts.append("")
+    parts.append(f"Question:\n{question}")
+    return "\n".join(parts) + "\n"
+
+
+def build_language_bias_prompt(question: str, context_prefix: str) -> str:
+    """Create a prompt variant that injects context bias without touching the video."""
+    return build_prompt(question, context_prefix=context_prefix)
 
 
 def infer_frames(model, processor, frames: np.ndarray, question: str, max_new_tokens: int = 32) -> str:
+    return infer_frames_prompt(
+        model=model,
+        processor=processor,
+        frames=frames,
+        prompt=build_prompt(question),
+        max_new_tokens=max_new_tokens,
+    )
+
+
+def infer_frames_prompt(
+    model,
+    processor,
+    frames: np.ndarray,
+    prompt: str,
+    max_new_tokens: int = 32,
+) -> str:
     import torch
 
-    prompt = f"USER: <video>\n{build_prompt(question)}\nASSISTANT:"
-    inputs = processor(text=prompt, videos=frames, return_tensors="pt")
+    full_prompt = f"USER: <video>\n{prompt}\nASSISTANT:"
+    inputs = processor(text=full_prompt, videos=frames, return_tensors="pt")
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
     with torch.inference_mode():
         output = model.generate(
             **inputs,
             do_sample=False,
-            temperature=0,
             max_new_tokens=max_new_tokens,
         )
 
@@ -201,6 +240,35 @@ def infer_frames(model, processor, frames: np.ndarray, question: str, max_new_to
     if "ASSISTANT:" in answer:
         answer = answer.split("ASSISTANT:")[-1]
     return normalize_yes_no(answer)
+
+
+def make_background_removed_video(
+    frames: np.ndarray,
+    threshold: int = 25,
+    apply_morphology: bool = True,
+) -> np.ndarray:
+    """Approximate background removal using a median background estimate.
+
+    This is a lightweight proxy for semantic segmentation:
+    - estimate background as the per-pixel median across frames
+    - keep only pixels that differ sufficiently from that background
+    """
+    if cv2 is None:
+        raise ImportError("opencv-python is required for background removal")
+
+    background = np.median(frames, axis=0).astype(np.uint8)
+    outputs = []
+    kernel = np.ones((3, 3), np.uint8)
+    for frame in frames:
+        diff = np.mean(np.abs(frame.astype(np.int16) - background.astype(np.int16)), axis=2)
+        mask = (diff > threshold).astype(np.uint8) * 255
+        if apply_morphology:
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        fg = cv2.bitwise_and(frame, frame, mask=mask)
+        outputs.append(fg)
+
+    return np.stack(outputs, axis=0)
 
 
 def load_eventhallusion_jsons(questions_root: str) -> Dict[str, list]:
@@ -457,6 +525,158 @@ def compare_conditions(
     return summary
 
 
+def run_language_bias_eval(
+    model,
+    processor,
+    questions_root: str,
+    video_root: str,
+    n_total_videos: int = 100,
+    n_frames: int = 4,
+    seed: int = 42,
+    context_prefixes: Optional[List[str]] = None,
+    split: str = "misleading",
+    show_progress: bool = True,
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    """
+    Measure language bias by keeping the video fixed and swapping prompt context.
+
+    Returns a dataframe with baseline/variant predictions and consistency scores.
+    """
+    if context_prefixes is None:
+        context_prefixes = [
+            "At the beach,",
+            "At school,",
+            "In a kitchen,",
+            "In an office,",
+        ]
+
+    splits = load_eventhallusion_jsons(questions_root)
+    if split not in splits:
+        raise ValueError(f"Unknown split: {split}")
+
+    target = {k: 0 for k in SPLIT_CANDIDATES}
+    target[split] = n_total_videos
+    samples = sample_eventhallusion_videos(
+        splits,
+        n_total_videos=n_total_videos,
+        seed=seed,
+        per_split=target,
+    )
+    video_index = build_video_index(video_root)
+
+    rows = []
+    iterator = tqdm(samples, desc=f"language_bias[{split}]", leave=True) if show_progress else samples
+    for sample in iterator:
+        video_path = find_video(sample.video_id, video_index, split=sample.split)
+        frames = load_video(video_path, n_frames=n_frames)
+        qa = sample.questions[0]
+        question = qa.get("question") or qa.get("Question") or qa.get("q") or ""
+        gt = normalize_yes_no(qa.get("answer") or qa.get("Answer") or qa.get("gt") or "")
+
+        baseline_prompt = build_prompt(question)
+        baseline_pred = infer_frames_prompt(model, processor, frames, baseline_prompt)
+
+        record = {
+            "split": sample.split,
+            "video_id": sample.video_id,
+            "question": question,
+            "gt": gt,
+            "baseline_pred": baseline_pred,
+            "baseline_correct": baseline_pred == gt,
+            "video_path": video_path,
+        }
+
+        for prefix in context_prefixes:
+            prompt = build_language_bias_prompt(question, prefix)
+            variant_key = prefix.lower().replace(",", "").replace(" ", "_")
+            pred = infer_frames_prompt(model, processor, frames, prompt)
+            record[f"pred_{variant_key}"] = pred
+            record[f"correct_{variant_key}"] = pred == gt
+            record[f"same_as_baseline_{variant_key}"] = pred == baseline_pred
+
+        rows.append(record)
+
+    df = pd.DataFrame(rows)
+    metrics: Dict[str, float] = {
+        "acc_baseline": float(df["baseline_correct"].mean()),
+    }
+    for prefix in context_prefixes:
+        variant_key = prefix.lower().replace(",", "").replace(" ", "_")
+        metrics[f"acc_{variant_key}"] = float(df[f"correct_{variant_key}"].mean())
+        metrics[f"same_{variant_key}"] = float(df[f"same_as_baseline_{variant_key}"].mean())
+
+    return df, metrics
+
+
+def run_context_bias_eval(
+    model,
+    processor,
+    questions_root: str,
+    video_root: str,
+    n_total_videos: int = 100,
+    n_frames: int = 4,
+    seed: int = 42,
+    split: str = "misleading",
+    show_progress: bool = True,
+    use_background_removal: bool = True,
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    """
+    Measure context bias by comparing normal videos vs background-removed videos.
+    """
+    splits = load_eventhallusion_jsons(questions_root)
+    if split not in splits:
+        raise ValueError(f"Unknown split: {split}")
+
+    target = {k: 0 for k in SPLIT_CANDIDATES}
+    target[split] = n_total_videos
+    samples = sample_eventhallusion_videos(
+        splits,
+        n_total_videos=n_total_videos,
+        seed=seed,
+        per_split=target,
+    )
+    video_index = build_video_index(video_root)
+
+    rows = []
+    iterator = tqdm(samples, desc=f"context_bias[{split}]", leave=True) if show_progress else samples
+    for sample in iterator:
+        video_path = find_video(sample.video_id, video_index, split=sample.split)
+        frames = load_video(video_path, n_frames=n_frames)
+        qa = sample.questions[0]
+        question = qa.get("question") or qa.get("Question") or qa.get("q") or ""
+        gt = normalize_yes_no(qa.get("answer") or qa.get("Answer") or qa.get("gt") or "")
+
+        base_pred = infer_frames_prompt(model, processor, frames, build_prompt(question))
+        if use_background_removal:
+            fg_frames = make_background_removed_video(frames)
+            fg_pred = infer_frames_prompt(model, processor, fg_frames, build_prompt(question))
+        else:
+            fg_pred = base_pred
+
+        rows.append(
+            {
+                "split": sample.split,
+                "video_id": sample.video_id,
+                "question": question,
+                "gt": gt,
+                "baseline_pred": base_pred,
+                "baseline_correct": base_pred == gt,
+                "foreground_pred": fg_pred,
+                "foreground_correct": fg_pred == gt,
+                "same_as_baseline": fg_pred == base_pred,
+                "video_path": video_path,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    metrics = {
+        "acc_baseline": float(df["baseline_correct"].mean()),
+        "acc_foreground": float(df["foreground_correct"].mean()),
+        "same_prediction_rate": float(df["same_as_baseline"].mean()),
+    }
+    return df, metrics
+
+
 __all__ = [
     "EHSample",
     "build_video_index",
@@ -464,11 +684,18 @@ __all__ = [
     "load_video",
     "add_gaussian_noise",
     "make_spatial_negative",
+    "gaussian_sigma_ratio",
+    "summarize_spatial_gaussian",
     "build_prompt",
+    "build_language_bias_prompt",
     "infer_frames",
+    "infer_frames_prompt",
+    "make_background_removed_video",
     "load_eventhallusion_jsons",
     "sample_eventhallusion_videos",
     "run_eventhallusion_eval",
+    "run_language_bias_eval",
+    "run_context_bias_eval",
     "save_results",
     "compare_conditions",
 ]
