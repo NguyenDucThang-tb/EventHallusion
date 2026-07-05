@@ -45,11 +45,13 @@ SPLIT_CANDIDATES = {
         "entire_rare.json",
         "entire_rare_events.json",
         "entire.json",
+        "entire_questions.json",
         "eventhallusion_entire_rare.json",
     ],
     "mix": [
         "mix_common_rare.json",
         "mix.json",
+        "mix_questions.json",
         "eventhallusion_mix_common_rare.json",
     ],
 }
