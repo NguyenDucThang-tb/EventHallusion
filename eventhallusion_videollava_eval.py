@@ -83,7 +83,7 @@ def build_video_index(video_root: str) -> Dict[str, str]:
     return index
 
 
-def find_video(video_id: str, video_index: Dict[str, str]) -> str:
+def find_video(video_id: str, video_index: Dict[str, str], split: Optional[str] = None) -> str:
     if video_id in video_index:
         return video_index[video_id]
 
@@ -93,6 +93,11 @@ def find_video(video_id: str, video_index: Dict[str, str]) -> str:
         if rev in video_index:
             return video_index[rev]
 
+        if split == "mix":
+            interleave_id = f"interleave_{right}"
+            if interleave_id in video_index:
+                return video_index[interleave_id]
+
     # Some releases append clip-specific suffixes, e.g. mix_099_clip_1.mp4.
     # Fall back to a prefix match so the question id still resolves.
     candidates = sorted(
@@ -101,6 +106,21 @@ def find_video(video_id: str, video_index: Dict[str, str]) -> str:
     )
     if candidates:
         return video_index[candidates[0]]
+
+    if split == "mix":
+        mix_suffix = video_id.split("_", 1)[-1] if "_" in video_id else video_id
+        mix_candidates = sorted(
+            (
+                k
+                for k in video_index
+                if k.startswith("interleave_" + mix_suffix)
+                or k.endswith("/interleave_" + mix_suffix)
+                or k.endswith("/" + mix_suffix)
+            ),
+            key=len,
+        )
+        if mix_candidates:
+            return video_index[mix_candidates[0]]
 
     # Last resort: try matching on the split prefix and numeric suffix.
     if "_" in video_id:
@@ -292,7 +312,7 @@ def run_eventhallusion_eval(
     rows = []
     predictions: Dict[str, Dict[str, Dict]] = {}
     for sample in samples:
-        video_path = find_video(sample.video_id, video_index)
+        video_path = find_video(sample.video_id, video_index, split=sample.split)
         frames = load_video(video_path, n_frames=n_frames)
         if use_spatial_negative:
             frames = make_spatial_negative(frames, sigma=sigma)
