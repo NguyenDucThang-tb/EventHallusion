@@ -18,7 +18,7 @@ Recently, Multimodal Large Language Models (MLLMs) have made significant progres
 **a. Clone this repository.**
 
 ```shell
-git clone https://github.com/Stevetich/EventHallusion.git
+git clone https://github.com/NguyenDucThang-tb/EventHallusion.git
 cd EventHallusion/
 ```
 
@@ -32,7 +32,7 @@ pip install -r requirements.txt
 
 **c. Prepare Data.**
 
-We have released our videos, which can be downloaded from [google drive](https://drive.google.com/file/d/1IPmx6Y80UrXwVPmZJh6zjCPHtlsw4p9n/view?usp=sharing). The questions for evaluation can be found in `questions/`.
+We have released our videos, which can be downloaded from [google drive](https://drive.google.com/file/d/1IPmx6Y80UrXwVPmZJh6zjCPHtlsw4p9n/view?usp=sharing). The files in `questions/` are only annotations and question sets, not video files.
 
 ### Run inference
 **1. GPT-4o**
