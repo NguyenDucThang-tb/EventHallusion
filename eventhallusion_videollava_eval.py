@@ -27,6 +27,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from tqdm.auto import tqdm
 
 try:
     from decord import VideoReader, cpu
@@ -294,6 +295,8 @@ def run_eventhallusion_eval(
     seed: int = 42,
     use_spatial_negative: bool = False,
     per_split: Optional[Dict[str, int]] = None,
+    show_progress: bool = True,
+    condition_name: str = "normal",
 ) -> Tuple[pd.DataFrame, Dict[str, float], dict]:
     """
     Returns:
@@ -311,7 +314,9 @@ def run_eventhallusion_eval(
 
     rows = []
     predictions: Dict[str, Dict[str, Dict]] = {}
-    for sample in samples:
+    print(f"[{condition_name}] samples: {len(samples)}")
+    sample_iter = tqdm(samples, desc=f"{condition_name} videos", leave=True) if show_progress else samples
+    for sample in sample_iter:
         video_path = find_video(sample.video_id, video_index, split=sample.split)
         frames = load_video(video_path, n_frames=n_frames)
         if use_spatial_negative:
@@ -325,7 +330,8 @@ def run_eventhallusion_eval(
             pred_video["desc"] = ""
             pred_video["judgement"] = ""
 
-        for qa in sample.questions:
+        qa_iter = tqdm(sample.questions, desc=f"{condition_name}:{sample.video_id}", leave=False) if show_progress and len(sample.questions) > 1 else sample.questions
+        for qa in qa_iter:
             question = qa.get("question") or qa.get("Question") or qa.get("q") or ""
             gt = normalize_yes_no(qa.get("answer") or qa.get("Answer") or qa.get("gt") or "")
             pred = infer_frames(model, processor, frames, question)
@@ -353,6 +359,8 @@ def run_eventhallusion_eval(
             )
 
         predictions.setdefault(sample.split, {})[sample.video_id] = pred_video
+        if show_progress and hasattr(sample_iter, "set_postfix"):
+            sample_iter.set_postfix(split=sample.split, video=sample.video_id)
 
     df = pd.DataFrame(rows)
     metrics = {"overall": float(df["correct"].mean())}
@@ -385,6 +393,7 @@ def compare_conditions(
     sigma: float = 25.0,
     seed: int = 42,
     per_split: Optional[Dict[str, int]] = None,
+    show_progress: bool = True,
 ) -> pd.DataFrame:
     """
     Convenience wrapper that runs both:
@@ -403,6 +412,8 @@ def compare_conditions(
         seed=seed,
         use_spatial_negative=False,
         per_split=per_split,
+        show_progress=show_progress,
+        condition_name="normal",
     )
     neg_df, neg_metrics, neg_pred = run_eventhallusion_eval(
         model=model,
@@ -415,6 +426,8 @@ def compare_conditions(
         seed=seed,
         use_spatial_negative=True,
         per_split=per_split,
+        show_progress=show_progress,
+        condition_name="spatial_gaussian",
     )
 
     normal_paths = save_results(normal_df, out_dir, "eventhallusion_normal")
