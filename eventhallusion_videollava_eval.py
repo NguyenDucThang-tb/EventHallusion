@@ -69,7 +69,17 @@ def build_video_index(video_root: str) -> Dict[str, str]:
     root = Path(video_root)
     index: Dict[str, str] = {}
     for p in root.rglob("*.mp4"):
-        index[p.stem] = str(p)
+        path_str = str(p)
+        rel_str = str(p.relative_to(root))
+        # Store a few aliases so we can resolve different archive layouts.
+        for key in {
+            p.stem,
+            p.name,
+            p.with_suffix("").name,
+            rel_str,
+            Path(rel_str).with_suffix("").as_posix(),
+        }:
+            index[key] = path_str
     return index
 
 
@@ -91,6 +101,23 @@ def find_video(video_id: str, video_index: Dict[str, str]) -> str:
     )
     if candidates:
         return video_index[candidates[0]]
+
+    # Last resort: try matching on the split prefix and numeric suffix.
+    if "_" in video_id:
+        prefix, suffix = video_id.split("_", 1)
+        loose_candidates = sorted(
+            (
+                k
+                for k in video_index
+                if (prefix in k and suffix in k)
+                or k.endswith("/" + suffix + ".mp4")
+                or k.endswith("/" + suffix)
+                or k.startswith(suffix)
+            ),
+            key=len,
+        )
+        if loose_candidates:
+            return video_index[loose_candidates[0]]
 
     raise FileNotFoundError(video_id)
 
