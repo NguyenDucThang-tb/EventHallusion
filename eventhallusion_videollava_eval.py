@@ -83,6 +83,15 @@ def find_video(video_id: str, video_index: Dict[str, str]) -> str:
         if rev in video_index:
             return video_index[rev]
 
+    # Some releases append clip-specific suffixes, e.g. mix_099_clip_1.mp4.
+    # Fall back to a prefix match so the question id still resolves.
+    candidates = sorted(
+        (k for k in video_index if k.startswith(video_id + "_") or k.startswith(video_id + "-")),
+        key=len,
+    )
+    if candidates:
+        return video_index[candidates[0]]
+
     raise FileNotFoundError(video_id)
 
 
