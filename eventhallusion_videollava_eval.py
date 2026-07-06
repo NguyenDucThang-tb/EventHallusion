@@ -9,6 +9,8 @@ It assumes you already have:
 The goal is to compare:
   1. Normal video input
   2. Spatial Gaussian negative input
+  3. Prompt/context shifts against the caption/bias action pairs in EventHallusion
+  4. Background removal as a lightweight context ablation
 
 This is useful for testing whether spatial negatives reduce language/context
 shortcut behavior on EventHallusion, especially on:
@@ -20,6 +22,7 @@ shortcut behavior on EventHallusion, especially on:
 from __future__ import annotations
 
 import json
+import re
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -188,6 +191,144 @@ def normalize_yes_no(text: str) -> str:
     if up.startswith("NO"):
         return "No"
     return text
+
+
+_ACTION_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "at",
+    "be",
+    "been",
+    "being",
+    "by",
+    "for",
+    "from",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "the",
+    "this",
+    "that",
+    "these",
+    "those",
+    "to",
+    "was",
+    "were",
+    "with",
+    "what",
+    "where",
+    "who",
+    "which",
+    "video",
+    "person",
+    "man",
+    "woman",
+    "boy",
+    "girl",
+    "child",
+    "kid",
+    "someone",
+    "something",
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "people",
+    "they",
+    "them",
+    "their",
+    "his",
+    "her",
+    "its",
+    "our",
+    "your",
+    "he",
+    "she",
+    "we",
+    "you",
+}
+
+
+def normalize_text(text: str) -> str:
+    text = (text or "").strip().lower()
+    text = text.replace("\n", " ")
+    text = re.sub(r"\s+", " ", text)
+    text = text.strip(" .,:;!?\"'`()[]{}")
+    return text
+
+
+def extract_action_focus(text: str) -> str:
+    """Extract a short action phrase from a caption/prediction."""
+    text = normalize_text(text)
+    if not text:
+        return ""
+
+    first_sentence = re.split(r"[.!?]", text, maxsplit=1)[0].strip()
+    copula = re.search(r"\b(is|are|was|were|am|be|being|been|seems|appears|looks)\b", first_sentence)
+    if copula:
+        first_sentence = first_sentence[copula.end() :].strip()
+
+    return first_sentence or text
+
+
+def tokenize_content_words(text: str) -> List[str]:
+    phrase = extract_action_focus(text)
+    tokens = re.findall(r"[a-z]+", phrase)
+    return [tok for tok in tokens if tok not in _ACTION_STOPWORDS]
+
+
+def action_similarity_score(pred: str, ref: str) -> float:
+    """Heuristic similarity for short action phrases."""
+    pred_tokens = tokenize_content_words(pred)
+    ref_tokens = tokenize_content_words(ref)
+    if not pred_tokens or not ref_tokens:
+        return 0.0
+
+    pred_set = set(pred_tokens)
+    ref_set = set(ref_tokens)
+    overlap = len(pred_set & ref_set) / len(pred_set | ref_set)
+    pred_head = pred_tokens[0]
+    ref_head = ref_tokens[0]
+    head_bonus = 1.0 if pred_head == ref_head else 0.0
+    return float(0.7 * head_bonus + 0.3 * overlap)
+
+
+def action_alignment_label(pred: str, caption: str, bias: Optional[str] = None) -> str:
+    caption_score = action_similarity_score(pred, caption)
+    if not bias:
+        return "caption"
+    bias_score = action_similarity_score(pred, bias)
+    if caption_score >= bias_score:
+        return "caption"
+    return "bias"
+
+
+def action_shift_label(base_label: str, variant_label: str) -> str:
+    if base_label == "caption" and variant_label == "bias":
+        return "caption_to_bias"
+    if base_label == "bias" and variant_label == "caption":
+        return "bias_to_caption"
+    if base_label == variant_label:
+        return "stable"
+    return "other"
+
+
+def build_action_prompt(question: str, context_prefix: str = "") -> str:
+    prefix = context_prefix.strip()
+    parts = []
+    if prefix:
+        parts.append(prefix)
+    parts.append("Describe the main action in the video using a short phrase.")
+    parts.append("Answer with only the action phrase.")
+    parts.append("")
+    parts.append(question.strip())
+    return "\n".join(parts) + "\n"
 
 
 def build_prompt(question: str, context_prefix: str = "") -> str:
@@ -677,6 +818,246 @@ def run_context_bias_eval(
     return df, metrics
 
 
+def _action_sample_meta(sample: EHSample) -> Tuple[str, str, str]:
+    event_info = sample.meta.get("event_info") or {}
+    caption = str(event_info.get("caption") or "")
+    bias = str(event_info.get("bias") or event_info.get("unexpected") or "")
+    scene = str(event_info.get("scene") or "")
+    return caption, bias, scene
+
+
+def run_action_language_bias_eval(
+    model,
+    processor,
+    questions_root: str,
+    video_root: str,
+    n_total_videos: int = 100,
+    n_frames: int = 4,
+    seed: int = 42,
+    context_prefixes: Optional[List[str]] = None,
+    split: str = "misleading",
+    show_progress: bool = True,
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    """Evaluate whether prompt context shifts action prediction toward the bias action."""
+    if context_prefixes is None:
+        context_prefixes = [
+            "The following video was recorded at a beach.",
+            "The following video was recorded at school.",
+            "The following video was recorded in a kitchen.",
+            "The following video was recorded in an office.",
+        ]
+
+    splits = load_eventhallusion_jsons(questions_root)
+    if split not in splits:
+        raise ValueError(f"Unknown split: {split}")
+
+    target = {k: 0 for k in SPLIT_CANDIDATES}
+    target[split] = n_total_videos
+    samples = sample_eventhallusion_videos(
+        splits,
+        n_total_videos=n_total_videos,
+        seed=seed,
+        per_split=target,
+    )
+    video_index = build_video_index(video_root)
+
+    rows = []
+    iterator = tqdm(samples, desc=f"action_language[{split}]", leave=True) if show_progress else samples
+    for sample in iterator:
+        video_path = find_video(sample.video_id, video_index, split=sample.split)
+        frames = load_video(video_path, n_frames=n_frames)
+        caption, bias, scene = _action_sample_meta(sample)
+
+        base_prompt = build_action_prompt("What is happening in the video?")
+        baseline_pred = infer_frames_prompt(model, processor, frames, base_prompt)
+        baseline_label = action_alignment_label(baseline_pred, caption, bias)
+
+        record = {
+            "split": sample.split,
+            "video_id": sample.video_id,
+            "scene": scene,
+            "caption": caption,
+            "bias": bias,
+            "baseline_pred": baseline_pred,
+            "baseline_label": baseline_label,
+            "baseline_vs_caption": action_similarity_score(baseline_pred, caption),
+            "baseline_vs_bias": action_similarity_score(baseline_pred, bias),
+            "video_path": video_path,
+        }
+
+        for prefix in context_prefixes:
+            variant_key = prefix.lower().replace(".", "").replace(",", "").replace(" ", "_")
+            prompt = build_action_prompt("What is happening in the video?", context_prefix=prefix)
+            pred = infer_frames_prompt(model, processor, frames, prompt)
+            label = action_alignment_label(pred, caption, bias)
+
+            record[f"pred_{variant_key}"] = pred
+            record[f"label_{variant_key}"] = label
+            record[f"same_as_baseline_{variant_key}"] = pred == baseline_pred
+            record[f"shift_{variant_key}"] = action_shift_label(baseline_label, label)
+            record[f"caption_score_{variant_key}"] = action_similarity_score(pred, caption)
+            record[f"bias_score_{variant_key}"] = action_similarity_score(pred, bias)
+
+        rows.append(record)
+
+    df = pd.DataFrame(rows)
+    metrics: Dict[str, float] = {
+        "baseline_caption_alignment": float((df["baseline_label"] == "caption").mean()),
+        "baseline_bias_alignment": float((df["baseline_label"] == "bias").mean()),
+    }
+    for prefix in context_prefixes:
+        variant_key = prefix.lower().replace(".", "").replace(",", "").replace(" ", "_")
+        metrics[f"caption_alignment_{variant_key}"] = float((df[f"label_{variant_key}"] == "caption").mean())
+        metrics[f"bias_alignment_{variant_key}"] = float((df[f"label_{variant_key}"] == "bias").mean())
+        metrics[f"same_prediction_{variant_key}"] = float(df[f"same_as_baseline_{variant_key}"].mean())
+        metrics[f"caption_to_bias_{variant_key}"] = float((df[f"shift_{variant_key}"] == "caption_to_bias").mean())
+        metrics[f"bias_to_caption_{variant_key}"] = float((df[f"shift_{variant_key}"] == "bias_to_caption").mean())
+
+    return df, metrics
+
+
+def run_action_context_bias_eval(
+    model,
+    processor,
+    questions_root: str,
+    video_root: str,
+    n_total_videos: int = 100,
+    n_frames: int = 4,
+    seed: int = 42,
+    split: str = "misleading",
+    show_progress: bool = True,
+    use_background_removal: bool = True,
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    """Evaluate whether removing background shifts action prediction away from context bias."""
+    splits = load_eventhallusion_jsons(questions_root)
+    if split not in splits:
+        raise ValueError(f"Unknown split: {split}")
+
+    target = {k: 0 for k in SPLIT_CANDIDATES}
+    target[split] = n_total_videos
+    samples = sample_eventhallusion_videos(
+        splits,
+        n_total_videos=n_total_videos,
+        seed=seed,
+        per_split=target,
+    )
+    video_index = build_video_index(video_root)
+
+    rows = []
+    iterator = tqdm(samples, desc=f"action_context[{split}]", leave=True) if show_progress else samples
+    for sample in iterator:
+        video_path = find_video(sample.video_id, video_index, split=sample.split)
+        frames = load_video(video_path, n_frames=n_frames)
+        caption, bias, scene = _action_sample_meta(sample)
+
+        base_pred = infer_frames_prompt(model, processor, frames, build_action_prompt("What is happening in the video?"))
+        base_label = action_alignment_label(base_pred, caption, bias)
+
+        if use_background_removal:
+            fg_frames = make_background_removed_video(frames)
+            fg_pred = infer_frames_prompt(model, processor, fg_frames, build_action_prompt("What is happening in the video?"))
+        else:
+            fg_frames = frames
+            fg_pred = base_pred
+        fg_label = action_alignment_label(fg_pred, caption, bias)
+
+        rows.append(
+            {
+                "split": sample.split,
+                "video_id": sample.video_id,
+                "scene": scene,
+                "caption": caption,
+                "bias": bias,
+                "baseline_pred": base_pred,
+                "baseline_label": base_label,
+                "foreground_pred": fg_pred,
+                "foreground_label": fg_label,
+                "same_as_baseline": fg_pred == base_pred,
+                "shift": action_shift_label(base_label, fg_label),
+                "baseline_vs_caption": action_similarity_score(base_pred, caption),
+                "baseline_vs_bias": action_similarity_score(base_pred, bias),
+                "foreground_vs_caption": action_similarity_score(fg_pred, caption),
+                "foreground_vs_bias": action_similarity_score(fg_pred, bias),
+                "video_path": video_path,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    metrics = {
+        "baseline_caption_alignment": float((df["baseline_label"] == "caption").mean()),
+        "baseline_bias_alignment": float((df["baseline_label"] == "bias").mean()),
+        "foreground_caption_alignment": float((df["foreground_label"] == "caption").mean()),
+        "foreground_bias_alignment": float((df["foreground_label"] == "bias").mean()),
+        "same_prediction_rate": float(df["same_as_baseline"].mean()),
+        "caption_to_bias": float((df["shift"] == "caption_to_bias").mean()),
+        "bias_to_caption": float((df["shift"] == "bias_to_caption").mean()),
+        "stable": float((df["shift"] == "stable").mean()),
+    }
+    return df, metrics
+
+
+def save_action_context_visualizations(
+    df: pd.DataFrame,
+    out_dir: str,
+    video_root: str,
+    split: str = "misleading",
+    max_examples: int = 6,
+    changed_only: bool = True,
+    n_frames: int = 4,
+) -> List[str]:
+    """Save side-by-side original vs background-removed frame grids for inspection."""
+    if cv2 is None:
+        raise ImportError("opencv-python is required for background-removal visualizations")
+
+    import matplotlib.pyplot as plt
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    video_index = build_video_index(video_root)
+
+    subset = df[df["split"] == split].copy()
+    if changed_only and "same_as_baseline" in subset.columns:
+        subset = subset[subset["same_as_baseline"] == False]  # noqa: E712
+    if subset.empty:
+        subset = df[df["split"] == split].copy()
+
+    paths: List[str] = []
+    for idx, (_, row) in enumerate(subset.head(max_examples).iterrows()):
+        video_path = row.get("video_path") or find_video(str(row["video_id"]), video_index, split=split)
+        frames = load_video(str(video_path), n_frames=n_frames)
+        fg_frames = make_background_removed_video(frames)
+
+        fig, axes = plt.subplots(2, min(n_frames, 4), figsize=(4 * min(n_frames, 4), 7))
+        axes = np.atleast_2d(axes)
+        limit = min(n_frames, 4)
+        for j in range(limit):
+            axes[0, j].imshow(frames[j])
+            axes[0, j].axis("off")
+            axes[0, j].set_title(f"Original {j+1}")
+            axes[1, j].imshow(fg_frames[j])
+            axes[1, j].axis("off")
+            axes[1, j].set_title(f"Foreground {j+1}")
+
+        caption = row.get("caption", "")
+        bias = row.get("bias", "")
+        baseline_pred = row.get("baseline_pred", "")
+        fg_pred = row.get("foreground_pred", "")
+        fig.suptitle(
+            "Background removal shift\n"
+            f"Caption: {caption}\n"
+            f"Bias: {bias}\n"
+            f"Baseline: {baseline_pred} | Foreground: {fg_pred}",
+            fontsize=10,
+        )
+        fig.tight_layout()
+        out_path = out / f"action_context_example_{idx+1}.png"
+        fig.savefig(out_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        paths.append(str(out_path))
+
+    return paths
+
+
 __all__ = [
     "EHSample",
     "build_video_index",
@@ -696,6 +1077,16 @@ __all__ = [
     "run_eventhallusion_eval",
     "run_language_bias_eval",
     "run_context_bias_eval",
+    "build_action_prompt",
+    "extract_action_focus",
+    "tokenize_content_words",
+    "action_similarity_score",
+    "action_alignment_label",
+    "action_shift_label",
+    "_action_sample_meta",
+    "run_action_language_bias_eval",
+    "run_action_context_bias_eval",
+    "save_action_context_visualizations",
     "save_results",
     "compare_conditions",
 ]

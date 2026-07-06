@@ -14,13 +14,15 @@ EventHallusion is the first benchmark that focuses on the evaluation of event ha
 Recently, Multimodal Large Language Models (MLLMs) have made significant progress in the video comprehension field. Despite remarkable content reasoning and instruction following capabilities they demonstrated, the hallucination problem of these VideoLLMs is less explored compared with its counterpart in the image domain. To mitigate this gap, we first propose **EventHallusion**, a novel benchmark that focuses on assessing the VideoLMMs' hallucination phenomenon on video event comprehension. Based on the observation that existing VideoLLMs are entangled with the priors stemming from their foundation models, our EventHallusion is curated by meticulously collecting videos and annotating questions to intentionally mislead the VideoLLMs into interpreting events based on these priors rather than accurately understanding the video content. On the other hand, we also propose a simple yet effective method, called Temporal Contrastive Decoding (TCD), to tackle the hallucination problems of VideoLLMs. The proposed TCD suppresses the model's preference toward their priors by comparing the original video with a constructed counterpart, whose temporal cues are disrupted, during the autoregressive decoding stage. Through comprehensive evaluation of eight open-source and two closed-source VideoLLMs on the proposed EventHallusion benchmark, we find that the open-source models suffer significantly from hallucination problems, whereas the closed-source models perform markedly better. By further equipping open-sourced VideoLLMs with the proposed TCD approach, evident performance improvements are achieved across most metrics in the EventHallusion benchmark
 
 ## Experiment Design Notes
-For the Colab notebook in this repo, we focus on the **misleading** split more heavily because it is the cleanest way to probe:
+For the Colab notebook in this repo, we focus on the **misleading** split more heavily because it is the cleanest way to probe action-level hallucination:
 
-- `Language prior bias`: keep the video fixed and change only the prompt wording or context prefix.
-- `Context bias`: keep the question fixed and compare normal video vs background-removed video.
+- `Language prior bias`: keep the video fixed, ask for the action, and change only the prompt wording or context prefix.
+- `Context bias`: keep the prompt fixed, compare normal video vs background-removed video, and check whether the predicted action shifts.
+- `Caption vs bias`: use the `caption` field in `event_info` as the target action and the `bias` field as the distractor action.
 - `Spatial Gaussian strength`: add per-pixel Gaussian noise with a configurable `sigma`; smaller `sigma` keeps the video closer to the original, so the effect may be subtle.
+- `Visualization`: save before/after background-removal grids for qualitative inspection.
 
-The notebook samples about `100` misleading videos and `50` each from `entire` and `mix` for the main benchmark, then optionally runs extra language/context ablations on the misleading split.
+The notebook samples about `100` misleading videos and `50` each from `entire` and `mix` for the main benchmark, then runs extra action-level language/context ablations on the misleading split.
 
 ## Getting Started
 ### Prepare Environment and Data
