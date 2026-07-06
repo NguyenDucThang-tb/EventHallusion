@@ -19,6 +19,7 @@ For the Colab notebook in this repo, we focus on the **misleading** split more h
 - `Language prior bias`: keep the video fixed, ask for the action, and change only the prompt wording or context prefix.
 - `Context bias`: keep the prompt fixed, compare normal video vs background-removed video, and check whether the predicted action shifts.
 - `Caption vs bias`: use the `caption` field in `event_info` as the target action and the `bias` field as the distractor action.
+- `Shift counts`: report how often predictions move from `caption -> bias` and `bias -> caption`.
 - `Spatial Gaussian strength`: add per-pixel Gaussian noise with a configurable `sigma`; smaller `sigma` keeps the video closer to the original, so the effect may be subtle.
 - `Visualization`: save before/after background-removal grids for qualitative inspection.
 

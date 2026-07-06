@@ -319,6 +319,12 @@ def action_shift_label(base_label: str, variant_label: str) -> str:
     return "other"
 
 
+def summarize_shift_counts(df: pd.DataFrame, shift_col: str = "shift") -> pd.DataFrame:
+    counts = df[shift_col].value_counts(dropna=False).rename_axis("shift").reset_index(name="count")
+    counts["rate"] = counts["count"] / max(len(df), 1)
+    return counts
+
+
 def build_action_prompt(question: str, context_prefix: str = "") -> str:
     prefix = context_prefix.strip()
     parts = []
@@ -904,14 +910,20 @@ def run_action_language_bias_eval(
     metrics: Dict[str, float] = {
         "baseline_caption_alignment": float((df["baseline_label"] == "caption").mean()),
         "baseline_bias_alignment": float((df["baseline_label"] == "bias").mean()),
+        "baseline_caption_count": int((df["baseline_label"] == "caption").sum()),
+        "baseline_bias_count": int((df["baseline_label"] == "bias").sum()),
     }
     for prefix in context_prefixes:
         variant_key = prefix.lower().replace(".", "").replace(",", "").replace(" ", "_")
         metrics[f"caption_alignment_{variant_key}"] = float((df[f"label_{variant_key}"] == "caption").mean())
         metrics[f"bias_alignment_{variant_key}"] = float((df[f"label_{variant_key}"] == "bias").mean())
         metrics[f"same_prediction_{variant_key}"] = float(df[f"same_as_baseline_{variant_key}"].mean())
+        metrics[f"caption_count_{variant_key}"] = int((df[f"label_{variant_key}"] == "caption").sum())
+        metrics[f"bias_count_{variant_key}"] = int((df[f"label_{variant_key}"] == "bias").sum())
         metrics[f"caption_to_bias_{variant_key}"] = float((df[f"shift_{variant_key}"] == "caption_to_bias").mean())
         metrics[f"bias_to_caption_{variant_key}"] = float((df[f"shift_{variant_key}"] == "bias_to_caption").mean())
+        metrics[f"caption_to_bias_count_{variant_key}"] = int((df[f"shift_{variant_key}"] == "caption_to_bias").sum())
+        metrics[f"bias_to_caption_count_{variant_key}"] = int((df[f"shift_{variant_key}"] == "bias_to_caption").sum())
 
     return df, metrics
 
@@ -988,10 +1000,17 @@ def run_action_context_bias_eval(
         "baseline_bias_alignment": float((df["baseline_label"] == "bias").mean()),
         "foreground_caption_alignment": float((df["foreground_label"] == "caption").mean()),
         "foreground_bias_alignment": float((df["foreground_label"] == "bias").mean()),
+        "baseline_caption_count": int((df["baseline_label"] == "caption").sum()),
+        "baseline_bias_count": int((df["baseline_label"] == "bias").sum()),
+        "foreground_caption_count": int((df["foreground_label"] == "caption").sum()),
+        "foreground_bias_count": int((df["foreground_label"] == "bias").sum()),
         "same_prediction_rate": float(df["same_as_baseline"].mean()),
         "caption_to_bias": float((df["shift"] == "caption_to_bias").mean()),
         "bias_to_caption": float((df["shift"] == "bias_to_caption").mean()),
         "stable": float((df["shift"] == "stable").mean()),
+        "caption_to_bias_count": int((df["shift"] == "caption_to_bias").sum()),
+        "bias_to_caption_count": int((df["shift"] == "bias_to_caption").sum()),
+        "stable_count": int((df["shift"] == "stable").sum()),
     }
     return df, metrics
 
@@ -1042,8 +1061,9 @@ def save_action_context_visualizations(
         bias = row.get("bias", "")
         baseline_pred = row.get("baseline_pred", "")
         fg_pred = row.get("foreground_pred", "")
+        shift = row.get("shift", action_shift_label(str(row.get("baseline_label", "")), str(row.get("foreground_label", ""))))
         fig.suptitle(
-            "Background removal shift\n"
+            f"Background removal shift [{shift}]\n"
             f"Caption: {caption}\n"
             f"Bias: {bias}\n"
             f"Baseline: {baseline_pred} | Foreground: {fg_pred}",
@@ -1051,6 +1071,70 @@ def save_action_context_visualizations(
         )
         fig.tight_layout()
         out_path = out / f"action_context_example_{idx+1}.png"
+        fig.savefig(out_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        paths.append(str(out_path))
+
+    return paths
+
+
+def save_action_language_visualizations(
+    df: pd.DataFrame,
+    out_dir: str,
+    video_root: str,
+    split: str = "misleading",
+    max_examples: int = 6,
+    n_frames: int = 4,
+    prefix_fields: Optional[List[str]] = None,
+) -> List[str]:
+    """Save compact visual summaries for language-shift examples."""
+    if cv2 is None:
+        raise ImportError("opencv-python is required for visualization helpers")
+
+    import matplotlib.pyplot as plt
+
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    video_index = build_video_index(video_root)
+
+    if prefix_fields is None:
+        prefix_fields = [c for c in df.columns if c.startswith("pred_")]
+
+    subset = df[df["split"] == split].copy()
+    if subset.empty:
+        return []
+
+    paths: List[str] = []
+    for idx, (_, row) in enumerate(subset.head(max_examples).iterrows()):
+        video_path = row.get("video_path") or find_video(str(row["video_id"]), video_index, split=split)
+        frames = load_video(str(video_path), n_frames=n_frames)
+
+        fig = plt.figure(figsize=(14, 6))
+        gs = fig.add_gridspec(2, 3, width_ratios=[1.4, 1, 1])
+        ax0 = fig.add_subplot(gs[:, 0])
+        ax0.imshow(frames[0])
+        ax0.axis("off")
+        ax0.set_title("Video frame 1")
+
+        text_ax = fig.add_subplot(gs[:, 1:])
+        text_ax.axis("off")
+        lines = [
+            f"Video: {row.get('video_id', '')}",
+            f"Scene: {row.get('scene', '')}",
+            f"Caption: {row.get('caption', '')}",
+            f"Bias: {row.get('bias', '')}",
+            f"Baseline: {row.get('baseline_pred', '')} [{row.get('baseline_label', '')}]",
+            "",
+        ]
+        for field in prefix_fields[:4]:
+            label_field = field.replace("pred_", "label_")
+            shift_field = field.replace("pred_", "shift_")
+            lines.append(f"{field}: {row.get(field, '')} | {row.get(label_field, '')} | {row.get(shift_field, '')}")
+        text_ax.text(0.0, 1.0, "\n".join(lines), va="top", ha="left", fontsize=10, family="monospace")
+        fig.suptitle("Language prompt shift summary", fontsize=12)
+        fig.tight_layout()
+
+        out_path = out / f"action_language_example_{idx+1}.png"
         fig.savefig(out_path, dpi=200, bbox_inches="tight")
         plt.close(fig)
         paths.append(str(out_path))
@@ -1087,6 +1171,7 @@ __all__ = [
     "run_action_language_bias_eval",
     "run_action_context_bias_eval",
     "save_action_context_visualizations",
+    "save_action_language_visualizations",
     "save_results",
     "compare_conditions",
 ]
